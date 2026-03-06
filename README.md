@@ -1,122 +1,150 @@
-# SAP Integration System
+# SAP Integration Orchestrator
 
-An asynchronous, non-blocking task queue for dispatching requests to SAP API. Clients submit tasks freely and continue working while execution happens in the background — results are surfaced automatically as they arrive.
+A multi-client task queue system for integrating with SAP ERP. Each client gets an isolated RabbitMQ queue, tasks are executed serially per client, and results are persisted to PostgreSQL.
 
 ---
 
-## Overview
-
-This project connects a CLI client to an SAP ERP system through a message queue. Tasks are picked up by whichever worker is available first and executed in no guaranteed order. Multiple clients can run simultaneously, all sharing the same worker pool.
+## Architecture
 
 ```
-client_1.py  →  backend.py  →  RabbitMQ  →  actors.py  →  mcp_server.py  →  sap_api.py
-                                                  ↓
-                                               Redis  ←  (client polls for result)
+client.py
+   │  submits tasks
+   ▼
+task_queue.py  ──► RabbitMQ (per-client queue: sap_tasks.<client_id>)
+   │                             │
+   │                             ▼
+   │                       worker process
+   │                             │
+   │                       mcp_server.py
+   │                             │
+   │                        sap_api.py
+   │                             │
+   ▼                             ▼
+postgres_backend.py  ◄───── result stored
+   │
+   ▼
+client polls DB for status
 ```
 
+**Key design decisions:**
+
+- **One queue per client** — tasks are isolated between clients and run strictly in submission order.
+- **Dramatiq + RabbitMQ** — handles retries, message durability, and worker lifecycle.
+- **PostgreSQL result backend** — tasks are visible in the DB from the moment they're enqueued (as `PENDING`), before the worker picks them up.
+- **MCP tool layer** — SAP calls go through a FastMCP server (`sync_to_sap`), making the SAP integration swappable.
+
 ---
 
-## Components
+## File Overview
 
-| File | Role |
+| File | Responsibility |
 |---|---|
-| `client_1.py` | CLI interface, background polling, result display |
-| `client_2.py` | CLI interface, background polling, result display |
-| `backend.py` | Non-blocking task dispatch |
-| `actors.py` | Dramatiq worker definition and broker setup |
-| `mcp_server.py` | Standardised MCP tool interface to SAP |
-| `sap_api.py` | SAP ERP simulator (random delay, 0–6 min) |
+| `client.py` | Interactive CLI; accepts user input, enqueues tasks, polls for results |
+| `task_queue.py` | Broker setup, per-client actor registry, `enqueue_task()` dispatcher, worker entry point |
+| `mcp_server.py` | Server connecting to `sync_to_sap` tool |
+| `sap_api.py` | SAP ERP stub (simulates variable latency and occasional failures) |
+| `postgres_backend.py` | Dramatiq `ResultBackend` backed by PostgreSQL `tasks` table |
 
 ---
 
-## How It Works
+## Prerequisites
 
-1. The user types input at the `client_1.py` prompt.
-2. The client calls `backend.enqueue_task()`, which places the task on the RabbitMQ queue via Dramatiq's `.send()` and returns immediately.
-3. The first available worker picks up the task — **order of execution is not guaranteed**.
-4. The worker calls `mcp_server.sync_to_sap()`, which forwards the request to `sap_api.call_sap_erp()`.
-5. The SAP API simulates processing with a random delay between 0 and 5 minutes.
-6. Once done, the worker stores the result in **Redis**, keyed by message ID.
-7. A background thread in the client polls Redis every 5 seconds for that message ID and prints the result as soon as it arrives.
+- Python 3.11+
+- RabbitMQ running on `localhost:5672` (default guest credentials)
+- PostgreSQL with the `tasks` table (see schema below)
 
-The client remains fully interactive throughout — new tasks can be submitted at any time regardless of what is currently executing.
-
----
-
-## Result Storage (Redis)
-
-Results are currently stored in **Redis** using Dramatiq's `RedisBackend`.
-
-> **Note:** The Redis backend can be swapped out for your own database with minimal changes. Dramatiq supports custom result backends — implementing one requires a class that extends `dramatiq.results.backend.Backend` and defines `get_result` and `store_result`. This would allow results to be persisted in PostgreSQL, MongoDB, or any other store your infrastructure already uses.
-
----
-
-## Client Notifications
-
-| Event | Behaviour |
-|---|---|
-| Task submitted | Acknowledged immediately; prompt returns |
-| 30 seconds elapsed | Prints `PENDING` once |
-| Result arrives | Prints `DONE` with status and duration |
-| 3 minutes elapsed | Prints `TIMEOUT` and marks task as `ERROR` |
-| Worker exception | Prints `FAILED`; Dramatiq retries up to 3 times |
-
-Type `status` at any time to see the current state of all submitted tasks.
-
----
-
-## Running the Project
-
-Start RabbitMQ and Redis via Docker, then start the worker and client:
+### Python dependencies
 
 ```bash
-# Start RabbitMQ (with management UI on port 15672)
-docker run -d --name rabbitmq -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-
-# Start Redis
-docker run -d --name redis -p 6379:6379 redis
-
-# Terminal 1 — start the Dramatiq worker
-python3 -m dramatiq actors --watch . -v
-
-# Terminal 2 — start client 1
-python client_1.py
-
-# Terminal 2 — start client 2
-python client_2.py
+pip install dramatiq[rabbitmq] psycopg2-binary
 ```
 
-### Client commands
+### Database schema
 
-| Input | Action |
-|---|---|
-| Any text | Enqueue a new task |
-| `status` | Print the state of all tasks |
-| `quit` | Exit the client |
+```sql
+CREATE TABLE tasks (
+    key        VARCHAR(512) PRIMARY KEY,
+    status     INT          NOT NULL,   -- 0=SUCCESS, 1=PENDING, 2=ERROR
+    client_id  VARCHAR(512) NOT NULL,
+    intent     TEXT,
+    result     JSONB        NULL,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+```
 
----
+### Environment variables
 
-## Configuration
-
-| Parameter | Default | Location |
+| Variable | Default | Description |
 |---|---|---|
-| RabbitMQ URL | `amqp://guest:guest@localhost:5672` | `actors.py` |
-| Redis host | `localhost` | `actors.py` |
-| SAP simulated delay | 0–300 seconds | `sap_api.py` |
-| Poll interval | 5 seconds | `client_1.py` |
-| Pending notification threshold | 30 seconds | `client_1.py` |
-| Client-side timeout | 180 seconds | `client_1.py` |
-| Max worker retries | 3 | `actors.py` |
+| `PG_HOST` | `localhost` | PostgreSQL host |
+| `PG_PORT` | `5432` | PostgreSQL port |
+| `PG_DB` | `mydb` | Database name |
+| `PG_USER` | `postgres` | Database user |
+| `PG_PASSWORD` | *(empty)* | Database password |
 
 ---
 
-## Possible Extensions
+## Running
 
-### Ordered Execution
+### 1. Start the worker
 
-In this version, tasks are picked up by whichever worker is free — if two tasks are submitted close together, the second may complete before the first. If ordered, sequential execution is needed, this can be achieved in two complementary ways:
+Each client ID requires its own worker process consuming its dedicated queue:
 
-- **Per-client queues:** Each client publishes to its own named RabbitMQ queue. A dedicated worker per queue ensures no two tasks from the same client run at the same time.
-- **Dramatiq pipelines:** Tasks are chained at enqueue time using `dramatiq.pipeline()`. Each task in the chain is only dispatched after the previous one completes, enforcing strict submission order regardless of worker count.
+```bash
+python task_queue.py --client-id alice
+python task_queue.py --client-id bob   # separate terminal, separate client
+```
 
-Both approaches can be combined so that clients are isolated from each other while their own tasks always execute in order.
+### 2. Start the client
+
+In another terminal, run the interactive client for the same client ID:
+
+```bash
+python client.py --client-id alice
+```
+
+### 3. Submit tasks
+
+Once the client is running, type any text and press Enter to enqueue a task:
+
+```
+> postpone
+> w/o
+> status        # show all tasks for this client from DB
+> quit
+```
+
+---
+
+## Task Lifecycle
+
+1. User types input → `client.py` generates a UUID task ID and puts it on the local queue.
+2. The dispatcher thread calls `enqueue_task()`, which:
+   - Sends the message to RabbitMQ via the client's Dramatiq actor.
+   - Immediately writes a `PENDING` row to PostgreSQL.
+3. The worker picks up the message, calls `sync_to_sap()` via the MCP server, and stores the result (`SUCCESS` or `ERROR`) back to PostgreSQL.
+4. The client polls for the result every 5 seconds. After 30 seconds it prints a `PENDING...` warning. After 3 minutes it reports a timeout and cancels any queued tasks.
+
+### Retry behaviour
+
+Failed tasks are automatically retried up to **3 times** by Dramatiq before being marked `ERROR`.
+
+---
+
+## Status output
+
+Type `status` in the client to see all tasks for your client ID pulled directly from the database:
+
+```
+[Status:alice] 3 task(s):
+ [postpone] [DONE]     dramatiq:abc123 | duration=47s
+ [w/o] [PENDING]  dramatiq:def456
+ [transfer] [ERROR]    dramatiq:ghi789 | SAP execution failed
+```
+
+---
+
+## Notes
+
+- Tasks run **one at a time per client**. Multiple simultaneous clients each have their own queue and worker and do not interfere with each other.

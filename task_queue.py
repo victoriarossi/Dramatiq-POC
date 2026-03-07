@@ -1,19 +1,22 @@
 """
 task_queue.py — Merged actor registry, task dispatcher, and worker entry point.
 
-Usage:
+Usage (worker):
     python task_queue.py --client-id alice
 
-Replaces actors.py and backend.py.
-
 Responsibilities:
-  - Configure the Dramatiq broker and result backend (once)
-  - Register per-client actors (lazily, cached)
-  - Expose enqueue_task() for use by client.py
-  - Used by worker.py to register the actor before consuming
+  - Configure the Dramatiq broker and result backend (once on import)
+  - Register per-client actors lazily (cached in _actor_registry)
+  - Expose enqueue_task() for use by queue_manager.py
+  - Serve as the module Dramatiq imports when forking worker processes
+
+Note: enqueue_task() no longer calls create_pending(). The queue_manager
+owns all task_queue lifecycle; create_pending() is kept on PostgresBackend
+for any direct callers that still want it.
 """
 
 import os
+import sys
 
 import dramatiq
 from dramatiq.brokers.rabbitmq import RabbitmqBroker
@@ -22,7 +25,7 @@ from dramatiq.results import Results
 from postgres_backend import PostgresBackend
 from mcp_server import sync_to_sap
 
-# ── Broker + backend setup (runs once on import) ──────────────────────────────
+# ── Broker + backend (runs once on import) ────────────────────────────────────
 
 result_backend = PostgresBackend()
 broker = RabbitmqBroker(url="amqp://guest:guest@localhost:5672")
@@ -36,9 +39,9 @@ _actor_registry: dict = {}
 
 def make_actor(client_id: str):
     """
-    Returns the Dramatiq actor for this client, creating it only once.
-    Re-using the same actor instance ensures the worker and the sender
-    reference the same registered function name and queue.
+    Return the Dramatiq actor for *client_id*, creating it only once.
+    Re-using the same instance ensures worker and sender share the same
+    registered function name and queue.
     """
     if client_id in _actor_registry:
         return _actor_registry[client_id]
@@ -59,7 +62,7 @@ def make_actor(client_id: str):
             print(f"[Worker:{client_id}] Task {task_id} complete: {result}")
             return result
         except Exception as e:
-            print(f"[Worker:{client_id}] ERROR on task {task_id}: {e}. Retrying...")
+            print(f"[Worker:{client_id}] ERROR on task {task_id}: {e}. Retrying…")
             raise
 
     _actor_registry[client_id] = process_integration_task
@@ -70,22 +73,22 @@ def make_actor(client_id: str):
 
 def enqueue_task(client_id: str, task_id: str, user_input: str) -> object:
     """
-    Dispatch a task to this client's dedicated RabbitMQ queue.
-    Immediately writes a PENDING row to the DB, then returns the Dramatiq
-    message object so the caller can poll for results.
+    Send a message to this client's Dramatiq queue and return the message
+    object so the caller (queue_manager) can track it.
+
+    The queue_manager is responsible for writing / updating task_queue rows.
+    The `tasks` PENDING row is written by PostgresBackend.create_pending(),
+    which the manager calls after this function returns.
     """
-    actor = make_actor(client_id)
-    print(f"[Backend:{client_id}] Enqueueing task {task_id}: {user_input}")
+    actor   = make_actor(client_id)
     message = actor.send(task_id, user_input)
-
     result_backend.create_pending(message.message_id, client_id, user_input)
-
-    print(f"[Backend:{client_id}] Task {task_id} queued with message ID: {message.message_id}")
+    print(f"[Dispatcher:{client_id}] Task {task_id} → message {message.message_id}")
     return message
 
 
-# ── Module-level actor registration (runs in main + forked worker processes) ──
-# When Dramatiq forks workers, it re-imports this module. The actor must be
+# ── Module-level actor registration for forked worker processes ───────────────
+# When Dramatiq forks workers it re-imports this module. The actor must be
 # registered at import time so forked processes know how to handle messages.
 
 _client_id = os.environ.get("DRAMATIQ_CLIENT_ID")
@@ -97,8 +100,6 @@ if _client_id:
 
 if __name__ == "__main__":
     import argparse
-    import os
-    import sys
 
     parser = argparse.ArgumentParser(description="SAP task worker")
     parser.add_argument("--client-id", required=True, help="Client ID to consume tasks for")
@@ -107,7 +108,7 @@ if __name__ == "__main__":
     os.environ["DRAMATIQ_CLIENT_ID"] = args.client_id
     actor = make_actor(args.client_id)
 
-    print(f"[Worker] Registered actor for client {args.client_id!r} on queue: {actor.queue_name}")
+    print(f"[Worker] Registered actor for {args.client_id!r} on queue: {actor.queue_name}")
 
     sys.argv = ["dramatiq", "task_queue", "--queues", actor.queue_name]
     from dramatiq.cli import main

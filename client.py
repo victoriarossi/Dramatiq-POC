@@ -1,20 +1,23 @@
 """
 SAP Integration Client — scalable multi-client version.
 
-Each client writes tasks to the `task_queue` table in Postgres.
-The queue_manager.py process for this client_id owns dispatch and ordering.
-This process only handles user input and status display — no local queues,
-no polling threads, no in-memory task state.
+Each client writes tasks directly to the `task_queue` table in Postgres AND
+immediately publishes them to RabbitMQ (via tq_push → enqueue_task).
 
-Usage:
-    # Terminal 1 — worker
+RabbitMQ enforces sequential execution via prefetch_count=1: the worker only
+receives the next message after it has fully processed and ack'd the current one.
+
+queue_manager.py is no longer required — you only need two processes per client:
+
+    # Terminal 1 — worker (consumes from RabbitMQ, updates Postgres)
     python task_queue.py --client-id alice
 
-    # Terminal 2 — queue manager
-    python queue_manager.py --client-id alice
-
-    # Terminal 3 — client REPL
+    # Terminal 2 — client REPL
     python client.py --client-id alice
+
+Multiple clients are fully independent:
+    python task_queue.py --client-id bob
+    python client.py --client-id bob
 """
 
 import argparse
@@ -25,46 +28,36 @@ import uuid
 from postgres_backend import (
     tq_push,
     tq_all,
+    tq_get_result,
     QS_QUEUED,
     QS_RUNNING,
     QS_DONE,
     QS_ERROR,
-    QS_CANCELLED,)
+    QS_CANCELLED,
+)
 
 WATCHER_POLL_INTERVAL = 3  # seconds between DB polls in the watcher thread
 
-# Statuses that are terminal — once a task reaches one of these we stop watching it.
 _TERMINAL = {QS_DONE, QS_ERROR, QS_CANCELLED}
 
-# ── Status display labels ─────────────────────────────────────────────────────
-
 _QUEUE_LABEL = {
-    QS_QUEUED:    "QUEUED",
-    QS_RUNNING:   "RUNNING",
-    QS_DONE:      "DONE   ",
-    QS_ERROR:     "ERROR  ",
+    QS_QUEUED:    "QUEUED   ",
+    QS_RUNNING:   "RUNNING  ",
+    QS_DONE:      "DONE     ",
+    QS_ERROR:     "ERROR    ",
     QS_CANCELLED: "CANCELLED",
 }
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="SAP Integration Client")
-    parser.add_argument(
-        "--client-id",
-        required=True,
-        help="Unique name for this client instance (e.g. alice, bob).",
-    )
+    parser.add_argument("--client-id", required=True)
     return parser.parse_args()
 
 
-# ── Client ────────────────────────────────────────────────────────────────────
-
 class SAPClient:
     def __init__(self, client_id: str):
-        self.client_id = client_id
-        # task_id → last known status; seeded on startup so we don't re-announce
-        # tasks that already finished before this session started.
+        self.client_id  = client_id
         self._known: dict[str, str] = {}
         self._known_lock = threading.Lock()
 
@@ -73,16 +66,14 @@ class SAPClient:
     def _watcher(self) -> None:
         """
         Polls task_queue every WATCHER_POLL_INTERVAL seconds.
-        Prints a notification whenever a task's status changes to a terminal state.
-        Removes tasks from the watch set once they reach a terminal state so the
-        dict stays small even across long sessions.
+        Prints a notification on any terminal status transition.
         """
         while True:
             time.sleep(WATCHER_POLL_INTERVAL)
             try:
                 rows = tq_all(self.client_id)
             except Exception:
-                continue  # transient DB hiccup — just retry next cycle
+                continue
 
             with self._known_lock:
                 for row in rows:
@@ -91,20 +82,24 @@ class SAPClient:
                     prev    = self._known.get(task_id)
 
                     if prev == status:
-                        continue  # no change
-
+                        continue
                     self._known[task_id] = status
 
-                    # Only announce transitions *into* a terminal state so the
-                    # user isn't spammed on every QUEUED→RUNNING intermediate step.
                     if status == QS_DONE:
+                        result = tq_get_result(row["message_id"]) or {}
+                        duration = result.get("duration", "?")
+                        sap_id   = result.get("id", "?")
                         print(
-                            f"\n[✔] Task {task_id!r} DONE  |  {row['intent']!r}\n> ",
+                            f"\n[✔] Task {task_id!r} DONE  |  {row['intent']!r}"
+                            f"\n    SAP id={sap_id}  duration={duration}s\n> ",
                             end="", flush=True,
                         )
                     elif status == QS_ERROR:
+                        result = tq_get_result(row["message_id"]) or {}
+                        reason = result.get("error", "unknown")
                         print(
-                            f"\n[✗] Task {task_id!r} FAILED  |  {row['intent']!r}\n> ",
+                            f"\n[✗] Task {task_id!r} FAILED  |  {row['intent']!r}"
+                            f"\n    reason: {reason}\n> ",
                             end="", flush=True,
                         )
                     elif status == QS_CANCELLED:
@@ -114,13 +109,14 @@ class SAPClient:
                         )
 
     def _start_watcher(self) -> None:
-        """Seed _known with current DB state, then launch the watcher thread."""
         rows = tq_all(self.client_id)
         with self._known_lock:
             for row in rows:
                 self._known[row["task_id"]] = row["status"]
 
-        t = threading.Thread(target=self._watcher, daemon=True, name=f"watcher-{self.client_id}")
+        t = threading.Thread(
+            target=self._watcher, daemon=True, name=f"watcher-{self.client_id}"
+        )
         t.start()
 
     # ── Status ────────────────────────────────────────────────────────────────
@@ -130,7 +126,6 @@ class SAPClient:
         if not rows:
             print(f"[Status:{self.client_id}] No tasks found.\n")
             return
-
         print(f"\n[Status:{self.client_id}] {len(rows)} task(s):\n")
         for row in rows:
             label = _QUEUE_LABEL.get(row["status"], row["status"])
@@ -141,9 +136,10 @@ class SAPClient:
 
     def run(self) -> None:
         print(f"\nSAP Integration Client: {self.client_id!r}")
-        print(f"  Queue manager : python queue_manager.py --client-id {self.client_id}")
-        print(f"  Worker        : python task_queue.py --client-id {self.client_id}")
-        print("  Commands      : type any text to enqueue | 'status' | 'quit'\n")
+        print(f"  Worker   : python task_queue.py --client-id {self.client_id}")
+        print("  Commands : type any text to enqueue | 'status' | 'quit'\n")
+        print("  Note     : tasks execute sequentially (RabbitMQ prefetch=1).")
+        print("             A SAP failure cancels all queued tasks behind it.\n")
 
         self._start_watcher()
 
@@ -156,22 +152,21 @@ class SAPClient:
 
             if not user_input:
                 continue
-
             if user_input.lower() == "quit":
                 print("Goodbye.")
                 break
-
             if user_input.lower() == "status":
                 self.print_status()
                 continue
 
-            # Enqueue — just write a QUEUED row; queue_manager handles the rest.
+            # tq_push writes the Postgres row AND publishes to RabbitMQ.
             task_id = str(uuid.uuid4())[:8]
             row_id  = tq_push(self.client_id, task_id, user_input)
-            print(f"[Client:{self.client_id}] Task {task_id!r} queued (position #{row_id}): {user_input!r}\n")
+            print(
+                f"[Client:{self.client_id}] Task {task_id!r} queued "
+                f"(position #{row_id}): {user_input!r}\n"
+            )
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     args = parse_args()

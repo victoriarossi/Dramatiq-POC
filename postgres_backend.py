@@ -3,34 +3,34 @@ postgres_backend.py — Dramatiq result backend backed by PostgreSQL.
 
 Schema
 ------
-Existing table (unchanged):
+  tasks table (unchanged):
 
-  CREATE TABLE tasks (
-    key        VARCHAR(512) PRIMARY KEY,
-    status     INT          NOT NULL,          -- 0=SUCCESS, 1=PENDING, 2=ERROR
-    intent     VARCHAR(512) NOT NULL,
-    client_id  VARCHAR(512) NOT NULL,
-    result     JSONB        NULL,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-  );
+    CREATE TABLE tasks (
+      key        VARCHAR(512) PRIMARY KEY,
+      status     INT          NOT NULL,          -- 0=SUCCESS, 1=PENDING, 2=ERROR
+      intent     VARCHAR(512) NOT NULL,
+      client_id  VARCHAR(512) NOT NULL,
+      result     JSONB        NULL,
+      created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
 
-New table — run this once:
+  task_queue table (run once, see create_db.sql):
 
-  CREATE TABLE task_queue (
-    id         BIGSERIAL    PRIMARY KEY,                -- insertion order = execution order
-    client_id  VARCHAR(512) NOT NULL,
-    task_id    VARCHAR(64)  NOT NULL UNIQUE,
-    intent     TEXT         NOT NULL,
-    status     VARCHAR(32)  NOT NULL DEFAULT 'QUEUED',  -- QUEUED|RUNNING|DONE|ERROR|CANCELLED
-    message_id VARCHAR(512) NULL,                        -- Dramatiq message_id, set on dispatch
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-  );
-  CREATE INDEX ON task_queue (client_id, status, id);
+    CREATE TABLE task_queue (
+      id         BIGSERIAL    PRIMARY KEY,
+      client_id  VARCHAR(512) NOT NULL,
+      task_id    VARCHAR(64)  NOT NULL UNIQUE,
+      intent     TEXT         NOT NULL,
+      status     VARCHAR(32)  NOT NULL DEFAULT 'QUEUED',
+      message_id VARCHAR(512) NULL,
+      created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX ON task_queue (client_id, status, id);
 
-tasks.status constants  →  STATUS_*
-task_queue.status strings  →  QS_*
+tasks.status constants   → STATUS_*
+task_queue.status strings → QS_*
 
 Environment variables:
   PG_HOST      (default: localhost)
@@ -88,8 +88,6 @@ class PostgresBackend(ResultBackend):
     def __init__(self, *, namespace: str = "dramatiq"):
         super().__init__(namespace=namespace)
 
-    # ── internal helpers ──────────────────────────────────────────────────────
-
     def _key(self, message_id: str) -> str:
         return f"{self.namespace}:{message_id}"
 
@@ -122,15 +120,71 @@ class PostgresBackend(ResultBackend):
                     "key":       key,
                     "status":    status,
                     "client_id": client_id,
-                    "intent":    "",   # intent lives in task_queue; blank sentinel here
+                    "intent":    "",
+                    "result":    psycopg2.extras.Json(payload),
+                })
+
+    def _store(self, message_key: str, result, ttl: int):
+        """
+        Low-level write called by Dramatiq's base class for both store_result
+        and store_exception.  Newer Dramatiq versions route the nack/exception
+        path through here instead of store_result, so we must implement it.
+        result is already a wrapped dict at this point (not a raw Exception).
+        """
+        is_error = isinstance(result, Exception) or (
+            isinstance(result, dict) and result.get("type") == "django.core.exceptions.ImproperlyConfigured"
+        ) or (isinstance(result, dict) and "error" in result)
+
+        status  = STATUS_ERROR if is_error else STATUS_SUCCESS
+        payload = result if isinstance(result, dict) else {"error": str(result)}
+
+        sql = """
+            INSERT INTO tasks (key, status, client_id, intent, result)
+            VALUES (%(key)s, %(status)s, %(client_id)s, %(intent)s, %(result)s)
+            ON CONFLICT (key) DO UPDATE
+                SET status     = EXCLUDED.status,
+                    result     = EXCLUDED.result,
+                    updated_at = NOW()
+        """
+        with _pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {
+                    "key":       message_key,
+                    "status":    status,
+                    "client_id": "unknown",   # message object not available here
+                    "intent":    "",
+                    "result":    psycopg2.extras.Json(payload),
+                })
+
+    def store_exception(self, message, exception, ttl: int):
+        """
+        Called by Dramatiq after_nack when retries are exhausted.
+        Stores the exception as an ERROR row so the result is always queryable.
+        """
+        key       = self._key(message.message_id)
+        client_id = self._client_id_from_message(message)
+        payload   = {"error": str(exception)}
+
+        sql = """
+            INSERT INTO tasks (key, status, client_id, intent, result)
+            VALUES (%(key)s, %(status)s, %(client_id)s, %(intent)s, %(result)s)
+            ON CONFLICT (key) DO UPDATE
+                SET status     = EXCLUDED.status,
+                    result     = EXCLUDED.result,
+                    updated_at = NOW()
+        """
+        with _pg_connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, {
+                    "key":       key,
+                    "status":    STATUS_ERROR,
+                    "client_id": client_id,
+                    "intent":    "",
                     "result":    psycopg2.extras.Json(payload),
                 })
 
     def get_result(self, message, *, block: bool = False, timeout: int | None = None):
-        """
-        Poll `tasks` until status != PENDING.
-        Raises ResultMissing (non-blocking) or ResultTimeout (block + timeout elapsed).
-        """
+        """Poll `tasks` until status != PENDING."""
         key           = self._key(message.message_id)
         deadline      = (time.monotonic() + timeout / 1000.0) if (block and timeout is not None) else None
         poll_interval = 1.0
@@ -174,7 +228,6 @@ class PostgresBackend(ResultBackend):
                 cur.execute(sql, (key, STATUS_PENDING, client_id, intent))
 
     def all_tasks_for_client(self, client_id: str) -> list[dict]:
-        """All `tasks` rows for this client, ordered by creation time."""
         sql = """
             SELECT key, status, result, intent, created_at
             FROM tasks
@@ -187,12 +240,29 @@ class PostgresBackend(ResultBackend):
                 return cur.fetchall()
 
 
-# ── task_queue helpers (module-level, used by queue_manager + client) ─────────
+# ── task_queue helpers ────────────────────────────────────────────────────────
+
+def tq_get_result(message_id: str | None) -> dict | None:
+    """
+    Return the result payload from the `tasks` table for a given message_id,
+    or None if not found or message_id is None.
+    Used by the client watcher to display SAP result details on completion.
+    """
+    if not message_id:
+        return None
+    key = f"dramatiq:{message_id}"
+    with _pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT result FROM tasks WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return dict(row[0]) if row and row[0] else None
 
 def tq_push(client_id: str, task_id: str, intent: str) -> int:
     """
-    Append a QUEUED entry for this client.
-    Returns the new row's `id` — this is the stable execution order key.
+    Append a QUEUED entry for this client and immediately publish it to
+    RabbitMQ via enqueue_task().
+
+    Returns the new row's `id` (insertion order = logical execution order).
     """
     sql = """
         INSERT INTO task_queue (client_id, task_id, intent, status)
@@ -202,37 +272,38 @@ def tq_push(client_id: str, task_id: str, intent: str) -> int:
     with _pg_connect() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (client_id, task_id, intent, QS_QUEUED))
-            return cur.fetchone()[0]
+            row_id = cur.fetchone()[0]
+
+    # Publish to RabbitMQ — import here to avoid circular import at module load.
+    from task_queue import enqueue_task
+    message = enqueue_task(client_id, task_id, intent)
+
+    # Record the Dramatiq message_id so we can look it up if needed.
+    with _pg_connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE task_queue SET message_id=%s WHERE id=%s",
+                (message.message_id, row_id),
+            )
+
+    return row_id
 
 
-def tq_pop_next(conn, client_id: str) -> dict | None:
-    """
-    Within an *already open* transaction, lock and return the oldest QUEUED
-    row for this client, or None if empty.
-
-    Uses SKIP LOCKED — multiple queue_manager processes for the same
-    client_id are safe (they will each see a different row, or None).
-    The caller owns commit/rollback.
-    """
+def tq_get_by_task_id(task_id: str) -> dict | None:
+    """Return the task_queue row for *task_id*, or None if not found."""
     sql = """
-        SELECT id, task_id, intent
+        SELECT id, client_id, task_id, intent, status, message_id, created_at
         FROM task_queue
-        WHERE client_id = %s AND status = %s
-        ORDER BY id ASC
-        LIMIT 1
-        FOR UPDATE SKIP LOCKED
+        WHERE task_id = %s
     """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(sql, (client_id, QS_QUEUED))
-        return cur.fetchone()
+    with _pg_connect() as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(sql, (task_id,))
+            return cur.fetchone()
 
 
 def tq_mark_running(conn, row_id: int, message_id: str):
-    """
-    Flip a QUEUED row to RUNNING and record the Dramatiq message_id.
-    Must be called inside the same transaction as tq_pop_next so the
-    status change is atomic with the lock acquisition.
-    """
+    """Flip a QUEUED row to RUNNING (must be called inside an open transaction)."""
     with conn.cursor() as cur:
         cur.execute(
             "UPDATE task_queue SET status=%s, message_id=%s, updated_at=NOW() WHERE id=%s",
@@ -260,9 +331,8 @@ def tq_mark_error(row_id: int):
 
 def tq_cancel_queued(client_id: str) -> int:
     """
-    Cancel every QUEUED (not yet dispatched) row for this client.
-    Called immediately after a task fails so no downstream work is dispatched.
-    Returns the number of rows cancelled.
+    Cancel every QUEUED row for this client.
+    Returns the count of rows cancelled.
     """
     with _pg_connect() as conn:
         with conn.cursor() as cur:
@@ -275,10 +345,7 @@ def tq_cancel_queued(client_id: str) -> int:
 
 
 def tq_get_running(client_id: str) -> dict | None:
-    """
-    Return the single RUNNING row for this client, or None.
-    Used on queue_manager startup to recover from a crash mid-flight.
-    """
+    """Return the single RUNNING row for this client, or None."""
     sql = """
         SELECT id, task_id, intent, message_id
         FROM task_queue
@@ -292,7 +359,7 @@ def tq_get_running(client_id: str) -> dict | None:
 
 
 def tq_all(client_id: str) -> list[dict]:
-    """All task_queue rows for this client, ordered by insertion (= execution order)."""
+    """All task_queue rows for this client, ordered by insertion order."""
     sql = """
         SELECT id, task_id, intent, status, message_id, created_at
         FROM task_queue
@@ -303,3 +370,22 @@ def tq_all(client_id: str) -> list[dict]:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(sql, (client_id,))
             return cur.fetchall()
+
+
+# Kept for backward compatibility — no longer used by tq_push.
+def tq_pop_next(conn, client_id: str) -> dict | None:
+    """
+    Within an already-open transaction, lock and return the oldest QUEUED row.
+    Retained for any callers that still use it directly.
+    """
+    sql = """
+        SELECT id, task_id, intent
+        FROM task_queue
+        WHERE client_id = %s AND status = %s
+        ORDER BY id ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, (client_id, QS_QUEUED))
+        return cur.fetchone()

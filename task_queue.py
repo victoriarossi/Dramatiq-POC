@@ -5,15 +5,14 @@ Architecture
 ------------
 prefetch_count=1 is set on the RabbitMQ channel so the broker never delivers
 a second message to a worker until the first one is fully ack'd.  This makes
-RabbitMQ the sequencer — the queue_manager.py polling loop is no longer needed
-for ordering.
+RabbitMQ the sequencer — no external polling loop is needed for ordering.
 
 Each client gets its own queue:  sap_tasks.<client_id>
 
 Failure cascade
 ---------------
-If the SAP call fails (after all retries are exhausted), the worker:
-  1. Marks the task_queue row ERROR in Postgres.
+If the SAP call fails, the worker:
+  1. Marks the task row ERROR in Postgres.
   2. Cancels every remaining QUEUED row for that client in Postgres.
   3. Purges the client's RabbitMQ queue so those messages are never delivered.
 
@@ -35,19 +34,17 @@ import pika
 from dramatiq.brokers.rabbitmq import RabbitmqBroker
 from dramatiq.results import Results
 
-# Dramatiq logs ERROR + traceback on every actor exception and WARNING on retry
-# exhaustion. These are expected when SAP fails and the cascade fires — our own
-# print statements already communicate what happened, so suppress the noise.
 logging.getLogger("dramatiq.worker.WorkerThread").setLevel(logging.CRITICAL)
 logging.getLogger("dramatiq.middleware.retries.Retries").setLevel(logging.CRITICAL)
 
 from postgres_backend import (
     PostgresBackend,
-    tq_mark_done,
-    tq_mark_error,
-    tq_cancel_queued,
-    tq_get_by_task_id,
-    QS_CANCELLED,
+    task_get_by_task_id,
+    task_mark_running,
+    task_mark_done,
+    task_mark_error,
+    task_cancel_queued,
+    STATUS_CANCELLED,
 )
 from mcp_server import sync_to_sap
 
@@ -56,10 +53,6 @@ from mcp_server import sync_to_sap
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672")
 
 # ── Broker + result backend ───────────────────────────────────────────────────
-#
-# We override `consume` to always pass prefetch=1.  Dramatiq's RabbitmqBroker
-# calls channel.basic_qos(prefetch_count=prefetch) inside its consume() method,
-# so intercepting at that level is the cleanest hook point.
 
 result_backend = PostgresBackend()
 
@@ -72,7 +65,6 @@ _orig_consume = broker.consume
 
 
 def _consume_with_prefetch1(queue_name, prefetch=1, timeout=5000):
-    """Wrap broker.consume to hard-code prefetch=1."""
     return _orig_consume(queue_name, prefetch=1, timeout=timeout)
 
 
@@ -87,9 +79,8 @@ def make_actor(client_id: str):
     """
     Return the Dramatiq actor for *client_id*, creating it at most once.
 
-    The actor performs the SAP call and owns the failure cascade:
-      • on success → mark DONE, ack (implicit on return), RabbitMQ delivers next
-      • on failure → mark ERROR, cancel + purge remaining queue, re-raise
+    On success  → mark DONE, ack (implicit on return), RabbitMQ delivers next.
+    On failure  → mark ERROR, cascade cancel + purge, re-raise.
     """
     if client_id in _actor_registry:
         return _actor_registry[client_id]
@@ -98,45 +89,33 @@ def make_actor(client_id: str):
 
     @dramatiq.actor(
         store_results=True,
-        max_retries=0,          # no silent retries — a failure cascades immediately
+        max_retries=0,
         queue_name=queue_name,
         actor_name=f"process_integration_task_{client_id}",
     )
     def process_integration_task(task_id: str, input_data: str):
         print(f"[Worker:{client_id}] Picked up task {task_id!r}: {input_data!r}")
 
-        row    = tq_get_by_task_id(task_id)
-        row_id = row["id"] if row else None
+        row = task_get_by_task_id(task_id)
 
-        # Guard: if this row was already cancelled by a previous failure cascade,
-        # skip the SAP call entirely and ack silently. This closes the race window
-        # between _cascade_failure() cancelling Postgres rows and queue_purge()
-        # removing the RabbitMQ messages — a fast worker could pick up a message
-        # in that gap, so we must check here as a second line of defence.
-        if row and row["status"] == QS_CANCELLED:
+        # Guard: skip tasks already cancelled by a previous failure cascade.
+        if row and row["status"] == STATUS_CANCELLED:
             print(f"[Worker:{client_id}] Task {task_id!r} already CANCELLED — skipping.")
             return {"task_id": task_id, "skipped": True}
+
+        task_mark_running(task_id)
 
         try:
             result = sync_to_sap(input_data)
             result["task_id"] = task_id
             print(f"[Worker:{client_id}] Task {task_id!r} DONE: {result}")
-
-            if row_id is not None:
-                tq_mark_done(row_id)
-
-            # Implicit ack on clean return → RabbitMQ delivers next message.
+            task_mark_done(task_id, result)
             return result
 
         except Exception as exc:
             print(f"[Worker:{client_id}] FAILED task {task_id!r}: {exc}")
-
-            if row_id is not None:
-                tq_mark_error(row_id)
-
+            task_mark_error(task_id, str(exc))
             _cascade_failure(client_id, queue_name)
-
-            # Re-raise → Dramatiq records error result and nacks the message.
             raise
 
     _actor_registry[client_id] = process_integration_task
@@ -146,15 +125,10 @@ def make_actor(client_id: str):
 def _cascade_failure(client_id: str, queue_name: str) -> None:
     """
     Cancel all remaining QUEUED tasks in Postgres and purge the RabbitMQ queue.
-    Called inside the actor on any SAP failure.
     """
-    # 1 — Postgres: mark every QUEUED row for this client CANCELLED.
-    n = tq_cancel_queued(client_id)
+    n = task_cancel_queued(client_id)
     print(f"[Worker:{client_id}] Cascade: {n} task(s) cancelled in Postgres.")
 
-    # 2 — RabbitMQ: purge the queue so those messages are never delivered.
-    #     We open a fresh blocking pika connection to avoid touching Dramatiq's
-    #     internal channel state.
     try:
         params   = pika.URLParameters(RABBITMQ_URL)
         pika_con = pika.BlockingConnection(params)
@@ -167,9 +141,8 @@ def _cascade_failure(client_id: str, queue_name: str) -> None:
             f"({msg_count} message(s) removed from RabbitMQ)."
         )
     except Exception as purge_exc:
-        # Non-fatal: Postgres is already consistent.  The messages will be
-        # delivered but the worker will find their task_queue rows CANCELLED
-        # and skip them.
+        # Non-fatal: Postgres is already consistent. Messages that slip through
+        # will find their rows CANCELLED and be skipped by the guard above.
         print(
             f"[Worker:{client_id}] WARNING: could not purge RabbitMQ queue "
             f"{queue_name!r}: {purge_exc}"
@@ -180,16 +153,11 @@ def _cascade_failure(client_id: str, queue_name: str) -> None:
 
 def enqueue_task(client_id: str, task_id: str, user_input: str) -> object:
     """
-    Publish one message to this client's RabbitMQ queue and record a PENDING
-    row in `tasks`.
-
-    With prefetch_count=1 the broker holds back this message until the worker
-    has ack'd every message ahead of it — giving strict FIFO sequential
-    execution with zero polling overhead.
+    Publish one message to this client's RabbitMQ queue.
+    Returns the Dramatiq message object (caller uses message.message_id).
     """
     actor   = make_actor(client_id)
     message = actor.send(task_id, user_input)
-    result_backend.create_pending(message.message_id, client_id, user_input)
     print(f"[Dispatcher:{client_id}] Task {task_id!r} → message {message.message_id}")
     return message
 
@@ -216,8 +184,6 @@ if __name__ == "__main__":
     print(f"[Worker] Client={args.client_id!r}  queue={actor.queue_name}")
     print("[Worker] prefetch_count=1 · processes=1 · threads=1 → strict sequential execution")
 
-    # --processes 1 --threads 1: exactly one consumer in flight at a time.
-    # Combined with prefetch_count=1 this means at most one SAP call per client.
     sys.argv = [
         "dramatiq", "task_queue",
         "--queues",    actor.queue_name,
